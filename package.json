@@ -5,6 +5,7 @@
   "description": "Storefront for Nizamabad Black Pottery",
   "scripts": {
     "dev": "next dev -p 3000",
+    "test": "cross-env NODE_ENV=test next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",
     "lint": "next lint",
@@ -22,6 +23,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "autoprefixer": "^10.4.20",
+    "cross-env": "^10.1.0",
     "eslint": "^8.57.1",
     "eslint-config-next": "^15.5.25",
     "postcss": "^8.5.28",
