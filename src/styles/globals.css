@@ -1,0 +1,178 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --header-height: 4.5rem;
+  }
+
+  /* Respect a reader who has asked the OS for less motion. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-paper text-ink-900 font-sans antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* A visible, high-contrast focus ring - never removed, only styled. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ink-900 ring-offset-2 ring-offset-paper;
+  }
+
+  ::selection {
+    @apply bg-ink-900 text-paper;
+  }
+
+  h1, h2, h3, h4 {
+    @apply font-serif font-normal text-ink-900;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  /* Inputs inherit the type system rather than the browser default. */
+  input, textarea, select, button {
+    font: inherit;
+    color: inherit;
+  }
+}
+
+@layer components {
+  .shell {
+    @apply mx-auto w-full max-w-shell px-gutter;
+  }
+
+  .eyebrow {
+    @apply font-sans text-eyebrow uppercase tracking-[0.18em] text-ink-400;
+  }
+
+  /* ── Buttons ───────────────────────────────────────────────────────────── */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 border font-sans text-[0.8125rem] uppercase
+           tracking-[0.1em] transition-colors duration-200 ease-craft
+           disabled:cursor-not-allowed disabled:opacity-45;
+    padding: 0.9375rem 1.75rem;
+    /* 44px minimum, so every control clears the mobile tap-target guideline. */
+    min-height: 2.75rem;
+  }
+
+  .btn-primary {
+    @apply btn border-ink-900 bg-ink-900 text-paper hover:bg-ink-700 hover:border-ink-700;
+  }
+
+  .btn-secondary {
+    @apply btn border-ink-900/25 bg-transparent text-ink-900 hover:border-ink-900 hover:bg-ink-900 hover:text-paper;
+  }
+
+  .btn-ghost {
+    @apply btn border-transparent bg-transparent text-ink-600 hover:text-ink-900;
+    padding: 0.5rem 0.75rem;
+  }
+
+  .btn-sm {
+    padding: 0.625rem 1.125rem;
+    min-height: 2.5rem;
+    @apply text-[0.75rem];
+  }
+
+  /* ── Form controls ─────────────────────────────────────────────────────── */
+  .field {
+    @apply w-full border border-ink-200 bg-white px-3.5 py-3 text-[0.9375rem] text-ink-900
+           placeholder:text-ink-300 transition-colors
+           focus:border-ink-900 focus:outline-none focus:ring-1 focus:ring-ink-900
+           disabled:bg-ink-50 disabled:text-ink-400;
+    min-height: 2.75rem;
+  }
+
+  .field-error {
+    @apply border-danger focus:border-danger focus:ring-danger;
+  }
+
+  .label {
+    @apply mb-1.5 block font-sans text-micro font-medium text-ink-600;
+  }
+
+  .help {
+    @apply mt-1.5 block font-sans text-micro text-ink-400;
+  }
+
+  .error-text {
+    @apply mt-1.5 flex items-start gap-1.5 font-sans text-micro text-danger;
+  }
+
+  /* ── Surfaces ──────────────────────────────────────────────────────────── */
+  .card {
+    @apply border border-ink-100 bg-white;
+  }
+
+  .divider {
+    @apply border-t border-ink-100;
+  }
+
+  .prose-craft {
+    @apply max-w-prose font-serif text-[1.0625rem] leading-[1.75] text-ink-600;
+  }
+
+  .prose-craft p + p {
+    @apply mt-5;
+  }
+
+  .prose-craft strong {
+    @apply font-normal text-ink-900;
+  }
+
+  /* ── Loading skeleton ──────────────────────────────────────────────────── */
+  .skeleton {
+    @apply relative overflow-hidden bg-ink-100;
+  }
+
+  .skeleton::after {
+    content: '';
+    @apply absolute inset-0 -translate-x-full;
+    background-image: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.55), transparent);
+    animation: shimmer 1.6s infinite;
+  }
+
+  /* Screen-reader-only, but focusable - used by the skip link. */
+  .sr-focusable {
+    @apply sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100]
+           focus:bg-ink-900 focus:px-4 focus:py-3 focus:text-paper;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Fades the edges of a horizontally scrolling row, hinting there is more. */
+  .scroll-fade {
+    mask-image: linear-gradient(to right, transparent, black 1.5rem, black calc(100% - 1.5rem), transparent);
+  }
+
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
