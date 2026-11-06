@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { get, post, request } from '@/lib/api';
-import { useAuth, usePreferences } from '@/lib/store';
+import { useAuth, useCart, usePreferences } from '@/lib/store';
 import { formatMoney, formatDate } from '@/lib/format';
 import type { Order } from '@/lib/types';
 import { EmptyState, IconBag, Notice, Spinner } from './ui';
@@ -23,6 +23,7 @@ export function AccountView() {
 
   const [orders, setOrders] = useState<Order[]>([]);
   const [loadingOrders, setLoadingOrders] = useState(true);
+  const [ordersError, setOrdersError] = useState<string | null>(null);
 
   useEffect(() => {
     if (status === 'anonymous') router.replace('/sign-in?next=/account');
@@ -30,6 +31,8 @@ export function AccountView() {
 
   useEffect(() => {
     if (!accessToken) return;
+    setLoadingOrders(true);
+    setOrdersError(null);
     let cancelled = false;
 
     (async () => {
@@ -37,7 +40,7 @@ export function AccountView() {
         const data = await get<Order[]>('/orders', { accessToken, currency });
         if (!cancelled) setOrders(data);
       } catch {
-        if (!cancelled) setOrders([]);
+        if (!cancelled) setOrdersError('We could not load your orders. Please refresh the page to try again.');
       } finally {
         if (!cancelled) setLoadingOrders(false);
       }
@@ -55,6 +58,7 @@ export function AccountView() {
       /* Clearing local state is what matters; the cookie expires regardless. */
     }
     clear();
+    await useCart.getState().load();
     router.push('/');
   };
 
@@ -105,7 +109,7 @@ export function AccountView() {
                 <div key={i} className="skeleton h-28 w-full" />
               ))}
             </div>
-          ) : orders.length === 0 ? (
+          ) : ordersError ? <div className="mt-6"><Notice tone="error">{ordersError}</Notice></div> : orders.length === 0 ? (
             <div className="mt-6 border border-ink-100">
               <EmptyState
                 icon={<IconBag className="h-10 w-10" strokeWidth={0.9} />}

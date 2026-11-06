@@ -3,7 +3,7 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { Cart, CartNotice, ProductCard, User } from './types';
-import { ApiClientError, request } from './api';
+import { ApiClientError, request, setApiAccessToken } from './api';
 
 /**
  * Browser state.
@@ -70,24 +70,38 @@ type AuthState = {
   refresh: () => Promise<boolean>;
 };
 
+let sessionRefresh: Promise<boolean> | null = null;
 export const useAuth = create<AuthState>((set, get) => ({
   user: null,
   accessToken: null,
   status: 'idle',
 
-  setSession: (user, accessToken) => set({ user, accessToken, status: 'authenticated' }),
-  clear: () => set({ user: null, accessToken: null, status: 'anonymous' }),
+  setSession: (user, accessToken) => {
+    setApiAccessToken(accessToken);
+    set({ user, accessToken, status: 'authenticated' });
+  },
+  clear: () => {
+    setApiAccessToken(null);
+    set({ user: null, accessToken: null, status: 'anonymous' });
+    useCart.setState({ cart: null, status: 'idle' });
+    useWishlist.setState({ items: [], localIds: [] });
+  },
 
   /** Exchanges the refresh cookie for a new access token. Silent on failure. */
   refresh: async () => {
-    try {
-      const { data } = await request<{ user: User; accessToken: string }>('/auth/refresh', { method: 'POST' });
-      set({ user: data.user, accessToken: data.accessToken, status: 'authenticated' });
-      return true;
-    } catch {
-      set({ user: null, accessToken: null, status: 'anonymous' });
-      return false;
-    }
+    if (sessionRefresh) return sessionRefresh;
+    sessionRefresh = (async () => {
+      try {
+        const { data } = await request<{ user: User; accessToken: string }>('/auth/refresh', { method: 'POST' });
+        get().setSession(data.user, data.accessToken);
+        return true;
+      } catch {
+        setApiAccessToken(null);
+        set({ user: null, accessToken: null, status: 'anonymous' });
+        return false;
+      }
+    })();
+    try { return await sessionRefresh; } finally { sessionRefresh = null; }
   },
 }));
 
@@ -110,7 +124,7 @@ type CartState = {
   removeItem: (itemId: string) => Promise<void>;
   applyCoupon: (code: string) => Promise<{ ok: boolean; error?: string }>;
   removeCoupon: () => Promise<void>;
-  setDestination: (countryCode: string) => Promise<void>;
+  setDestination: (countryCode: string, regionCode?: string, postalCode?: string) => Promise<void>;
   selectShipping: (methodCode: string) => Promise<{ ok: boolean; error?: string }>;
   openDrawer: () => void;
   closeDrawer: () => void;
@@ -123,6 +137,7 @@ const cartContext = () => {
   return { currency, country: country ?? undefined, sessionId, accessToken: useAuth.getState().accessToken ?? undefined };
 };
 
+let cartLoad: Promise<void> | null = null;
 export const useCart = create<CartState>((set, get) => {
   /** Runs a cart mutation, applying the returned cart and normalising errors. */
   const mutate = async (
@@ -132,6 +147,7 @@ export const useCart = create<CartState>((set, get) => {
     const { itemId, ...requestInit } = init;
     set({ pendingItemId: itemId ?? null, error: null });
     try {
+      if (!get().cart || cartLoad) await get().load();
       const { data } = await request<Cart>(path, { ...requestInit, ...cartContext() });
       set({ cart: data, status: 'ready', notices: data.notices ?? [], pendingItemId: null });
       return { ok: true };
@@ -152,15 +168,19 @@ export const useCart = create<CartState>((set, get) => {
     isDrawerOpen: false,
 
     load: async () => {
-      if (get().status === 'loading') return;
+      if (cartLoad) return cartLoad;
       set({ status: 'loading' });
-      try {
-        const { data } = await request<Cart>('/cart', cartContext());
-        set({ cart: data, status: 'ready', notices: data.notices ?? [] });
-      } catch {
-        // An unreachable cart must not break the page; the badge simply shows nothing.
-        set({ status: 'error' });
-      }
+      cartLoad = (async () => {
+        try {
+          if (['idle', 'loading'].includes(useAuth.getState().status)) await useAuth.getState().refresh();
+          const { data } = await request<Cart>('/cart', cartContext());
+          set({ cart: data, status: 'ready', error: null, notices: data.notices ?? [] });
+        } catch {
+          // Preserve the last known cart while showing a retryable load error.
+          set({ status: 'error' });
+        }
+      })();
+      try { await cartLoad; } finally { cartLoad = null; }
     },
 
     addItem: async (productId, variantId, quantity = 1) => {
@@ -189,8 +209,8 @@ export const useCart = create<CartState>((set, get) => {
       await mutate('/cart/coupon', { method: 'DELETE' });
     },
 
-    setDestination: async (countryCode) => {
-      await mutate('/cart/destination', { method: 'POST', body: JSON.stringify({ countryCode }) });
+    setDestination: async (countryCode, regionCode, postalCode) => {
+      await mutate('/cart/destination', { method: 'POST', body: JSON.stringify({ countryCode, regionCode, postalCode }) });
     },
 
     selectShipping: (methodCode) =>

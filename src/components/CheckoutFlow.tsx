@@ -30,6 +30,7 @@ export function CheckoutFlow() {
   const router = useRouter();
   const { cart, status, load: loadCart, setDestination, selectShipping } = useCart();
   const user = useAuth((s) => s.user);
+  const authStatus = useAuth((s) => s.status);
   const currency = usePreferences((s) => s.currency);
 
   const [countries, setCountries] = useState<Country[]>([]);
@@ -43,6 +44,7 @@ export function CheckoutFlow() {
   const [shippingQuote, setShippingQuote] = useState<ShippingQuote | null>(null);
   const [shippingError, setShippingError] = useState<string | null>(null);
   const [loadingShipping, setLoadingShipping] = useState(false);
+  const [validatingAddress, setValidatingAddress] = useState(false);
   const [selectedMethod, setSelectedMethod] = useState<string | null>(null);
 
   const [provider, setProvider] = useState<string | null>(null);
@@ -52,23 +54,28 @@ export function CheckoutFlow() {
   const [isGift, setIsGift] = useState(false);
   const [giftMessage, setGiftMessage] = useState('');
   const [customerNote, setCustomerNote] = useState('');
+  const [pendingOrder, setPendingOrder] = useState<string | null>(null);
+
+  const refreshPaymentMethods = async () => {
+    const session = await get<{ paymentMethods: PaymentMethod[] }>('/checkout/session', { currency, revalidate: false });
+    const methods = (session.paymentMethods ?? []).filter((method) =>
+      method.provider !== 'stripe' || Boolean(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY));
+    setPaymentMethods(methods);
+    setProvider((current) => current && methods.some((m) => m.provider === current) ? current : null);
+  };
 
   // ── Boot ──────────────────────────────────────────────────────────────────
   useEffect(() => {
-    void loadCart();
+    if (authStatus === 'idle' || authStatus === 'loading') return;
     (async () => {
       try {
-        const [countryList, session] = await Promise.all([
-          get<Country[]>('/geo/countries'),
-          get<{ paymentMethods: PaymentMethod[]; customer: any }>('/checkout/session', { currency }).catch(() => null),
-        ]);
-        setCountries(countryList);
-        if (session) setPaymentMethods(session.paymentMethods ?? []);
+        await loadCart();
+        setCountries(await get<Country[]>('/geo/countries'));
       } catch {
         /* Handled by the per-section error states below. */
       }
     })();
-  }, [loadCart, currency]);
+  }, [loadCart, currency, authStatus]);
 
   // Prefill from the signed-in customer's saved details.
   useEffect(() => {
@@ -79,29 +86,38 @@ export function CheckoutFlow() {
   }, [user]);
 
   // ── Shipping ──────────────────────────────────────────────────────────────
-  const fetchShipping = async (countryCode: string) => {
+  const fetchShipping = async (destination: Address) => {
+    const { countryCode, regionCode, postalCode } = destination;
     setLoadingShipping(true);
     setShippingError(null);
     try {
-      await setDestination(countryCode);
+      setSelectedMethod(null);
+      await setDestination(countryCode, regionCode, postalCode);
+      if (useCart.getState().error) throw new Error(useCart.getState().error!);
       const quote = await get<ShippingQuote>('/cart/shipping-options', { currency, country: countryCode });
       setShippingQuote(quote);
 
       if (!quote.options.length) {
         setShippingError(quote.reason ?? 'No delivery service covers this address.');
+        setOrderError(quote.reason ?? 'No delivery service covers this address.');
         return;
       }
       // Default to the cheapest, which is what most people choose anyway.
       const cheapest = quote.options[0];
+      const selected = await selectShipping(cheapest.methodCode);
+      if (!selected.ok) throw new Error(selected.error);
       setSelectedMethod(cheapest.methodCode);
-      await selectShipping(cheapest.methodCode);
+      await refreshPaymentMethods();
+      return true;
     } catch (error) {
       setShippingQuote(null);
+      setOrderError(error instanceof Error ? error.message : 'We could not work out shipping. Please try again.');
       setShippingError(
         error instanceof ApiClientError
           ? error.message
           : 'We could not work out shipping for that address. Please check it and try again.',
       );
+      return false;
     } finally {
       setLoadingShipping(false);
     }
@@ -109,20 +125,22 @@ export function CheckoutFlow() {
 
   const submitAddress = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (validatingAddress || loadingShipping) return;
     setFieldErrors({});
     setOrderError(null);
 
-    if (!email.trim()) {
-      setFieldErrors({ email: 'We need an email address to send your order confirmation.' });
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim())) {
+      setFieldErrors({ email: 'Please enter a valid email address for your order confirmation.' });
       return;
     }
 
+    setValidatingAddress(true);
     try {
       // The server validates the address against its own country rules; the
       // browser's checks are a convenience, not the authority.
       const validated = await post<{ address: Address }>('/checkout/validate-address', address, { currency });
       setAddress(validated.address);
-      await fetchShipping(validated.address.countryCode);
+      if (!await fetchShipping(validated.address)) return;
       setStep('delivery');
       setAnnouncement('Address saved. Choose a delivery method.');
     } catch (error) {
@@ -132,37 +150,44 @@ export function CheckoutFlow() {
       } else {
         setOrderError('We could not check that address. Please try again.');
       }
+    } finally {
+      setValidatingAddress(false);
     }
   };
 
   const chooseMethod = async (option: ShippingOption) => {
-    setSelectedMethod(option.methodCode);
+    setLoadingShipping(true);
+    setShippingError(null);
     const result = await selectShipping(option.methodCode);
     if (!result.ok) {
       setShippingError(result.error ?? null);
+      setLoadingShipping(false);
       return;
     }
+    setSelectedMethod(option.methodCode);
 
     // Some payment methods (Cash on Delivery) are only offered for certain
     // delivery speeds, so re-fetch the list now that the method has changed.
     try {
-      const session = await get<{ paymentMethods: PaymentMethod[] }>('/checkout/session', { currency });
-      const methods = session.paymentMethods ?? [];
-      setPaymentMethods(methods);
-      setProvider((current) => (current && methods.some((m) => m.provider === current) ? current : null));
+      await refreshPaymentMethods();
     } catch {
-      /* The payment step re-derives from whatever paymentMethods already holds. */
+      setPaymentMethods([]);
+      setShippingError('We could not load payment options. Please choose delivery again.');
+    } finally {
+      setLoadingShipping(false);
     }
   };
 
   // ── Placing the order ─────────────────────────────────────────────────────
   const placeOrder = async () => {
+    if (placing) return;
+    let createdOrderNumber = pendingOrder;
     setPlacing(true);
     setOrderError(null);
     setFieldErrors({});
 
     try {
-      const created = await post<{ order: { orderNumber: string }; paymentMethods: PaymentMethod[] }>(
+      const created = pendingOrder ? null : await post<{ order: { orderNumber: string }; paymentMethods: PaymentMethod[] }>(
         '/checkout/orders',
         {
           email: email.trim().toLowerCase(),
@@ -175,12 +200,14 @@ export function CheckoutFlow() {
         { currency },
       );
 
-      const orderNumber = created.order.orderNumber;
-      const chosenProvider = provider ?? created.paymentMethods[0]?.provider ?? paymentMethods[0]?.provider;
+      const orderNumber = pendingOrder ?? created!.order.orderNumber;
+      createdOrderNumber = orderNumber;
+      setPendingOrder(orderNumber);
+      const chosenProvider = provider ?? paymentMethods[0]?.provider;
 
       const payment = await post<{ provider: string; clientSecret: string | null; redirectUrl: string | null }>(
         `/checkout/orders/${orderNumber}/payment?email=${encodeURIComponent(email.trim().toLowerCase())}`,
-        { provider: chosenProvider },
+        { provider: chosenProvider, returnUrl: `${window.location.origin}/checkout/processing?${new URLSearchParams({ order: orderNumber, email: email.trim().toLowerCase() })}` },
         { currency },
       );
 
@@ -199,6 +226,7 @@ export function CheckoutFlow() {
       if (error instanceof ApiClientError) {
         setFieldErrors(error.fieldErrors);
         setOrderError(error.message);
+        if (createdOrderNumber) router.push(`/checkout/retry/${createdOrderNumber}?email=${encodeURIComponent(email.trim().toLowerCase())}`);
         // A stock or shipping problem means the cart has moved under us.
         if (['INSUFFICIENT_STOCK', 'OUT_OF_STOCK', 'PRODUCT_UNAVAILABLE'].includes(error.code)) {
           await loadCart();
@@ -211,6 +239,7 @@ export function CheckoutFlow() {
   };
 
   // ── Render ────────────────────────────────────────────────────────────────
+  if (status === 'error') return <div className="shell py-section"><Notice tone="error">We could not load your basket.</Notice><button className="btn-primary mt-6" onClick={() => void loadCart()}>Try again</button></div>;
   if (status === 'idle' || status === 'loading') {
     return (
       <div className="shell py-section">
@@ -299,8 +328,8 @@ export function CheckoutFlow() {
 
                 <AddressForm value={address} onChange={setAddress} countries={countries} errors={fieldErrors} />
 
-                <button type="submit" className="btn-primary w-full sm:w-auto">
-                  Continue to delivery
+                <button type="submit" disabled={validatingAddress || loadingShipping} className="btn-primary w-full sm:w-auto">
+                  {validatingAddress || loadingShipping ? 'Checking delivery…' : 'Continue to delivery'}
                 </button>
               </form>
             ) : (

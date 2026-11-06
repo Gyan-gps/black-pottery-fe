@@ -31,7 +31,8 @@ export function SignInForm() {
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
-  const next = params.get('next') ?? '/account';
+  const target = params.get('next') ?? '/account';
+  const next = target.startsWith('/') && !target.startsWith('//') && !target.includes('\\') ? target : '/account';
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();

@@ -8,6 +8,7 @@ import { useCart, usePreferences } from '@/lib/store';
 import { formatMoney } from '@/lib/format';
 import type { Order } from '@/lib/types';
 import { IconAlert, IconCheck, Notice, Spinner } from './ui';
+import { StripePaymentForm } from './StripePaymentForm';
 
 /**
  * The settlement screen.
@@ -42,7 +43,9 @@ export function PaymentProcessing() {
   const orderNumber = params.get('order');
   const email = params.get('email') ?? '';
 
-  const [state, setState] = useState<'checking' | 'failed' | 'timeout' | 'missing'>('checking');
+  const [clientSecret, setClientSecret] = useState(params.get('cs'));
+  const [state, setState] = useState<'payment' | 'checking' | 'failed' | 'timeout' | 'missing'>(params.get('cs') && !params.get('redirect_status') ? 'payment' : 'checking');
+  const [pollVersion, setPollVersion] = useState(0);
   const [result, setResult] = useState<StatusResponse | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
@@ -55,6 +58,8 @@ export function PaymentProcessing() {
       setState('missing');
       return;
     }
+    if (state !== 'checking') return;
+    attempts.current = 0;
 
     let cancelled = false;
     let timer: number;
@@ -106,7 +111,7 @@ export function PaymentProcessing() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [orderNumber, query, currency, router, loadCart]);
+  }, [orderNumber, query, currency, router, loadCart, state, pollVersion]);
 
   const retry = useCallback(async () => {
     if (!orderNumber) return;
@@ -116,7 +121,7 @@ export function PaymentProcessing() {
     try {
       const payment = await post<{ clientSecret: string | null; redirectUrl: string | null }>(
         `/checkout/orders/${orderNumber}/payment${query}`,
-        {},
+        { returnUrl: `${window.location.origin}/checkout/processing?${new URLSearchParams({ order: orderNumber, email })}` },
         { currency },
       );
 
@@ -125,8 +130,9 @@ export function PaymentProcessing() {
         return;
       }
       // Reset and poll again for an inline retry.
-      attempts.current = 0;
-      setState('checking');
+      setClientSecret(payment.clientSecret);
+      setState(payment.clientSecret ? 'payment' : 'checking');
+      setPollVersion((value) => value + 1);
     } catch (error) {
       setRetryError(
         error instanceof ApiClientError
@@ -136,7 +142,12 @@ export function PaymentProcessing() {
     } finally {
       setRetrying(false);
     }
-  }, [orderNumber, query, currency]);
+  }, [orderNumber, query, currency, email]);
+
+  if (state === 'payment' && clientSecret && orderNumber) return <Shell title="Complete your payment">
+    <p className="prose-craft">Order {orderNumber}. Enter your payment details securely below.</p>
+    <StripePaymentForm clientSecret={clientSecret} returnUrl={`${window.location.origin}/checkout/processing?${new URLSearchParams({ order: orderNumber, email })}`} onConfirmed={() => setState('checking')} />
+  </Shell>;
 
   if (state === 'missing') {
     return (
@@ -179,7 +190,7 @@ export function PaymentProcessing() {
 
         <p className="prose-craft mt-6">
           Your order <span className="font-medium text-ink-900">{orderNumber}</span> is saved and the pieces are still
-          held for you. You can try again with the same or a different method.
+          available subject to stock when you retry. You can try again.
         </p>
 
         {result?.order.totals.total && (

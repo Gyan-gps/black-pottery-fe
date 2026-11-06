@@ -9,6 +9,12 @@
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:5000/api/v1';
 export const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000';
 
+// Browser requests stay on the storefront origin, including httpOnly auth and
+// cart cookies. Server components still call the upstream API directly.
+let browserAccessToken: string | null = null;
+let refreshInFlight: Promise<boolean> | null = null;
+export function setApiAccessToken(token: string | null) { browserAccessToken = token; }
+
 export type Money = { amount: number; currency: string };
 
 export type ApiEnvelope<T> = {
@@ -47,6 +53,7 @@ const NETWORK_MESSAGE =
   'We could not reach our servers. Check your connection and try again — nothing has been lost.';
 
 export type RequestOptions = RequestInit & {
+  authRetried?: boolean;
   /** Storefront context. Server components pass these explicitly; the browser store fills them in. */
   currency?: string;
   country?: string;
@@ -60,7 +67,7 @@ export type RequestOptions = RequestInit & {
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<ApiEnvelope<T>> {
   const {
-    currency, country, cartToken, accessToken, sessionId, revalidate, tags, headers, ...init
+    currency, country, cartToken, accessToken, sessionId, revalidate, tags, headers, authRetried, ...init
   } = options;
 
   const requestHeaders = new Headers(headers);
@@ -69,20 +76,21 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   if (country) requestHeaders.set('x-country', country);
   if (cartToken) requestHeaders.set('x-cart-token', cartToken);
   if (sessionId) requestHeaders.set('x-session-id', sessionId);
-  if (accessToken) requestHeaders.set('Authorization', `Bearer ${accessToken}`);
+  const token = accessToken ?? (typeof window !== 'undefined' ? browserAccessToken : null);
+  if (token) requestHeaders.set('Authorization', `Bearer ${token}`);
 
   const isMutation = Boolean(init.method && init.method !== 'GET');
 
   let response: Response;
   try {
-    response = await fetch(`${API_URL}${path}`, {
+    response = await fetch(`${typeof window === 'undefined' ? API_URL : '/api/store'}${path}`, {
       ...init,
       headers: requestHeaders,
       // Needed for the refresh-token cookie to travel with auth calls.
       credentials: 'include',
       // A mutation must never be served from a cache.
-      cache: isMutation ? 'no-store' : revalidate === false ? 'no-store' : undefined,
-      next: !isMutation && revalidate !== false ? { revalidate: revalidate ?? 60, tags } : undefined,
+      cache: typeof window !== 'undefined' || token || isMutation || revalidate === false ? 'no-store' : undefined,
+      next: typeof window === 'undefined' && !token && !isMutation && revalidate !== false ? { revalidate: revalidate ?? 60, tags } : undefined,
     });
   } catch {
     throw new ApiClientError(NETWORK_MESSAGE, 'NETWORK_ERROR', 0);
@@ -102,6 +110,14 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 
   if (!response.ok || payload?.success === false) {
+    if (typeof window !== 'undefined' && response.status === 401 &&
+        payload?.error?.code === 'TOKEN_EXPIRED' && !authRetried && !path.startsWith('/auth/')) {
+      if (!refreshInFlight) {
+        refreshInFlight = import('./store').then(({ useAuth }) => useAuth.getState().refresh())
+          .finally(() => { refreshInFlight = null; });
+      }
+      if (await refreshInFlight) return request<T>(path, { ...options, accessToken: browserAccessToken ?? undefined, authRetried: true });
+    }
     throw new ApiClientError(
       payload?.error?.message ?? 'Something failed on our side. Please try again in a moment.',
       payload?.error?.code ?? 'UNKNOWN_ERROR',
