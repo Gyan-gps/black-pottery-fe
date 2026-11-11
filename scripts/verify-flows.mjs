@@ -11,8 +11,9 @@ const { NextRequest } = await import(nextServerUrl);
 async function sourceUrl(path, replacements = []) {
   let source = await readFile(new URL(path, import.meta.url), 'utf8');
   for (const [from, to] of replacements) source = source.replaceAll(from, to);
-  const { outputText } = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } });
-  return `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
+  const { outputText } = ts.transpileModule(source, { fileName: path, compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } });
+  const resolved = outputText.replaceAll('"react/jsx-runtime"', JSON.stringify(pathToFileURL(require.resolve('react/jsx-runtime')).href));
+  return `data:text/javascript;base64,${Buffer.from(resolved).toString('base64')}`;
 }
 async function sourceModule(path, replacements = []) { return import(await sourceUrl(path, replacements)); }
 
@@ -44,8 +45,8 @@ try {
   check('Quantity PATCH reaches the API unchanged', () => { assert.equal(captured.method, 'PATCH'); assert.equal(captured.body, '{"quantity":1}'); });
   await call('DELETE', 'cart/items/item-1');
   check('Basket DELETE reaches the API', () => assert.equal(captured.method, 'DELETE'));
-  await call('POST', 'webhooks/phonepe', { 'content-type': 'application/json', 'x-verify': 'signature' }, '{"response":"base64"}');
-  check('Payment callback body and signature survive proxying', () => { assert.equal(captured.body, '{"response":"base64"}'); assert.equal(captured.headers['x-verify'], 'signature'); });
+  await call('POST', 'webhooks/phonepe', { 'content-type': 'application/json', authorization: 'sha256-webhook-hash' }, '{"event":"checkout.order.completed","payload":{"state":"COMPLETED"}}');
+  check('PhonePe v2 callback body and authorization survive proxying', () => { assert.match(captured.body, /checkout.order.completed/); assert.equal(captured.headers.authorization, 'sha256-webhook-hash'); });
   const blocked = await call('POST', 'auth/logout', { origin: 'https://unrelated.example' });
   check('Cross-origin account mutation is refused', () => assert.equal(blocked.status, 403));
   const invalid = await call('GET', 'fail?email=qa%40example.com');
@@ -69,6 +70,51 @@ try {
     api.setApiAccessToken(null);
     await api.get('/cart');
     check('Sign-out removes the account authorization header', () => assert.equal(fetchArgs[1].headers.get('authorization'), null));
+    const payments = await sourceModule('../src/lib/payments.ts', [["'./api'", JSON.stringify(apiUrl)]]);
+    const phonepe = { provider: 'phonepe', label: 'PhonePe', flow: 'redirect', logo: 'phonepe', testMode: true };
+    const cod = { provider: 'cod', label: 'Cash on Delivery', flow: 'cod', logo: 'cod' };
+    check('Configured PhonePe is preferred while COD remains available', () => assert.equal(payments.defaultPaymentProvider([cod, phonepe]), 'phonepe'));
+    check('Unconfigured online payment cannot become the default', () => { assert.equal(payments.defaultPaymentProvider([cod]), 'cod'); assert.equal(payments.defaultPaymentProvider([]), null); });
+    await payments.startOrderPayment({ orderNumber: 'NBP-TEST-1', email: 'QA@example.com', provider: 'phonepe', currency: 'INR', origin: 'http://localhost:3000' });
+    check('PhonePe submit explicitly selects the provider and preserves guest return context', () => {
+      assert.equal(fetchArgs[0], '/api/store/checkout/orders/NBP-TEST-1/payment?email=qa%40example.com');
+      const body = JSON.parse(fetchArgs[1].body);
+      assert.equal(body.provider, 'phonepe');
+      const returned = new URL(body.returnUrl);
+      assert.equal(returned.searchParams.get('email'), 'qa@example.com');
+      assert.equal(returned.searchParams.get('order'), 'NBP-TEST-1');
+      assert.equal(returned.searchParams.get('provider'), 'phonepe');
+    });
+    await payments.startOrderPayment({ orderNumber: 'NBP-TEST-1', email: 'QA@example.com', provider: 'phonepe', currency: 'INR', origin: 'http://localhost:3000' });
+    check('PhonePe retry starts payment on the existing store order', () => { assert.match(fetchArgs[0], /NBP-TEST-1\/payment/); assert.equal(JSON.parse(fetchArgs[1].body).provider, 'phonepe'); });
+    const attempt = { provider: 'phonepe', status: 'pending', clientSecret: null, redirectUrl: 'https://mercury-uat.phonepe.com/transact/test' };
+    check('PhonePe hosted checkout opens externally', () => assert.deepEqual(payments.paymentDestination(attempt, 'NBP-TEST-1', 'qa@example.com'), { external: true, url: attempt.redirectUrl }));
+    check('Pending or returned payment goes to verification, never directly to confirmation', () => {
+      const next = payments.paymentDestination({ ...attempt, redirectUrl: null }, 'NBP-TEST-1', 'qa@example.com');
+      assert.equal(next.external, false); assert.match(next.url, /^\/checkout\/processing\?/); assert.doesNotMatch(next.url, /confirmation/);
+    });
+    check('Unexpected checkout hosts cannot receive the shopper', () => {
+      for (const url of ['https://phonepe.com.attacker.example/pay', 'javascript:alert(1)', 'http://phonepe.com/pay']) assert.throws(() => payments.paymentDestination({ ...attempt, redirectUrl: url }, 'NBP-TEST-1', 'qa@example.com'));
+    });
+    const { createElement } = await import('react');
+    const { renderToStaticMarkup } = await import('react-dom/server');
+    const { PaymentMethods } = await sourceModule('../src/components/PaymentMethods.tsx', [[ '"react/jsx-runtime"', JSON.stringify(pathToFileURL(require.resolve('react/jsx-runtime')).href) ]]);
+    const renderMethods = (methods, selected, showUnavailablePhonePe) => renderToStaticMarkup(createElement(PaymentMethods, { methods, selected, showUnavailablePhonePe, onChange: () => {} }));
+    const availableMarkup = renderMethods([phonepe, cod], 'phonepe', true);
+    check('Payment UI renders selectable PhonePe, payment instruments, test mode and COD', () => {
+      assert.match(availableMarkup, /Pay online with PhonePe/); assert.match(availableMarkup, /netbanking/); assert.match(availableMarkup, /Test mode/); assert.match(availableMarkup, /Cash on Delivery/);
+      const input = availableMarkup.match(/<input[^>]*value="phonepe"[^>]*>/)?.[0]; assert.ok(input); assert.match(input, /checked/); assert.doesNotMatch(input, /disabled/);
+    });
+    const unavailableMarkup = renderMethods([cod], 'cod', true);
+    check('Missing PhonePe credentials show a disabled option while COD stays selected', () => {
+      assert.match(unavailableMarkup, /Currently unavailable/);
+      const input = unavailableMarkup.match(/<input[^>]*value="phonepe"[^>]*>/)?.[0]; assert.ok(input); assert.match(input, /disabled/); assert.doesNotMatch(input, /checked/);
+      const codInput = unavailableMarkup.match(/<input[^>]*value="cod"[^>]*>/)?.[0]; assert.match(codInput, /checked/);
+    });
+    check('No methods or international delivery cannot offer an enabled PhonePe fallback', () => {
+      const empty = renderMethods([], null, true); assert.match(empty, /disabled/);
+      assert.doesNotMatch(renderMethods([cod], 'cod', false), /PhonePe/);
+    });
     const storage = new Map();
     globalThis.localStorage = { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) };
     const store = await sourceModule('../src/lib/store.ts', [

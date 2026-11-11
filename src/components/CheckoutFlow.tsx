@@ -7,7 +7,9 @@ import clsx from 'clsx';
 import { ApiClientError, get, post } from '@/lib/api';
 import { useAuth, useCart, usePreferences } from '@/lib/store';
 import { formatMoney, formatDeliveryWindow, formatDeliveryDays } from '@/lib/format';
-import type { Address, Cart, Country, PaymentMethod, ShippingOption, ShippingQuote } from '@/lib/types';
+import type { Address, Country, PaymentMethod, ShippingOption, ShippingQuote } from '@/lib/types';
+import { defaultPaymentProvider, paymentDestination, startOrderPayment } from '@/lib/payments';
+import { PaymentMethods } from './PaymentMethods';
 import { AddressForm } from './AddressForm';
 import { CouponForm } from './CouponForm';
 import { ProductThumb } from './ProductImage';
@@ -47,7 +49,7 @@ export function CheckoutFlow() {
   const [validatingAddress, setValidatingAddress] = useState(false);
   const [selectedMethod, setSelectedMethod] = useState<string | null>(null);
 
-  const [provider, setProvider] = useState<string | null>(null);
+  const [provider, setProvider] = useState<PaymentMethod['provider'] | null>(null);
   const [placing, setPlacing] = useState(false);
   const [orderError, setOrderError] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState<string | null>(null);
@@ -61,7 +63,8 @@ export function CheckoutFlow() {
     const methods = (session.paymentMethods ?? []).filter((method) =>
       method.provider !== 'stripe' || Boolean(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY));
     setPaymentMethods(methods);
-    setProvider((current) => current && methods.some((m) => m.provider === current) ? current : null);
+    setProvider((current) => current && methods.some((m) => m.provider === current) ? current : defaultPaymentProvider(methods));
+    return methods;
   };
 
   // ── Boot ──────────────────────────────────────────────────────────────────
@@ -187,6 +190,11 @@ export function CheckoutFlow() {
     setFieldErrors({});
 
     try {
+      const chosenProvider = provider ?? defaultPaymentProvider(paymentMethods);
+      const available = await refreshPaymentMethods();
+      if (!chosenProvider || !available.some((method) => method.provider === chosenProvider)) {
+        throw new Error('That payment method is no longer available. Please choose another method.');
+      }
       const created = pendingOrder ? null : await post<{ order: { orderNumber: string }; paymentMethods: PaymentMethod[] }>(
         '/checkout/orders',
         {
@@ -203,37 +211,31 @@ export function CheckoutFlow() {
       const orderNumber = pendingOrder ?? created!.order.orderNumber;
       createdOrderNumber = orderNumber;
       setPendingOrder(orderNumber);
-      const chosenProvider = provider ?? paymentMethods[0]?.provider;
-
-      const payment = await post<{ provider: string; clientSecret: string | null; redirectUrl: string | null }>(
-        `/checkout/orders/${orderNumber}/payment?email=${encodeURIComponent(email.trim().toLowerCase())}`,
-        { provider: chosenProvider, returnUrl: `${window.location.origin}/checkout/processing?${new URLSearchParams({ order: orderNumber, email: email.trim().toLowerCase() })}` },
-        { currency },
-      );
+      if (chosenProvider === 'phonepe') setAnnouncement('Opening secure PhonePe checkout…');
+      const payment = await startOrderPayment({ orderNumber, email, provider: chosenProvider, currency, origin: window.location.origin });
+      const destination = paymentDestination(payment, orderNumber, email);
 
       // An off-site gateway (PhonePe) hands back a URL; an inline one (Stripe)
       // hands back a client secret. The processing page handles both.
-      if (payment.redirectUrl) {
-        window.location.href = payment.redirectUrl;
+      if (destination.external) {
+        window.location.assign(destination.url);
         return;
       }
-
-      const query = new URLSearchParams({ order: orderNumber, email: email.trim().toLowerCase() });
-      if (payment.clientSecret) query.set('cs', payment.clientSecret);
-      router.push(`/checkout/processing?${query}`);
+      router.push(destination.url);
     } catch (error) {
       setPlacing(false);
       if (error instanceof ApiClientError) {
         setFieldErrors(error.fieldErrors);
         setOrderError(error.message);
-        if (createdOrderNumber) router.push(`/checkout/retry/${createdOrderNumber}?email=${encodeURIComponent(email.trim().toLowerCase())}`);
+        if (createdOrderNumber) router.push(`/checkout/retry/${createdOrderNumber}?${new URLSearchParams({ email: email.trim().toLowerCase(), ...(provider ? { provider } : {}) })}`);
         // A stock or shipping problem means the cart has moved under us.
         if (['INSUFFICIENT_STOCK', 'OUT_OF_STOCK', 'PRODUCT_UNAVAILABLE'].includes(error.code)) {
           await loadCart();
           setStep('address');
         }
       } else {
-        setOrderError('We could not place your order. Nothing has been charged — please try again.');
+        setOrderError(error instanceof Error ? error.message : 'We could not place your order. Please try again.');
+        if (createdOrderNumber) router.push(`/checkout/retry/${createdOrderNumber}?${new URLSearchParams({ email: email.trim().toLowerCase(), ...(provider ? { provider } : {}) })}`);
       }
     }
   };
@@ -274,7 +276,9 @@ export function CheckoutFlow() {
   }
 
   const totals = cart.totals;
-  const canPay = Boolean(selectedMethod && cart.selectedShipping && !loadingShipping);
+  const selectedProvider = provider ?? defaultPaymentProvider(paymentMethods);
+  const canContinue = Boolean(selectedMethod && cart.selectedShipping && !loadingShipping && !shippingError);
+  const canPay = Boolean(canContinue && selectedProvider && paymentMethods.some((method) => method.provider === selectedProvider));
 
   return (
     <div className="shell py-10 lg:py-14">
@@ -443,7 +447,7 @@ export function CheckoutFlow() {
                         setStep('payment');
                         setAnnouncement('Delivery method chosen. Review and pay.');
                       }}
-                      disabled={!canPay}
+                      disabled={!canContinue}
                       className="btn-primary mt-6 w-full sm:w-auto"
                     >
                       Continue to payment
@@ -459,6 +463,9 @@ export function CheckoutFlow() {
             <section aria-labelledby="payment-heading" className="border-t border-ink-100 pt-10">
               <SectionHeading number={3} id="payment-heading" title="Payment" />
 
+              <PaymentMethods methods={paymentMethods} selected={selectedProvider} onChange={setProvider}
+                disabled={placing || loadingShipping} showUnavailablePhonePe={cart.countryCode === 'IN' && cart.baseCurrency === 'INR'} />
+
               {paymentMethods.length === 0 ? (
                 <div className="mt-6">
                   <Notice tone="error" title="No payment method is available">
@@ -468,43 +475,6 @@ export function CheckoutFlow() {
                 </div>
               ) : (
                 <>
-                  <fieldset className="mt-6">
-                    <legend className="sr-only">Payment method</legend>
-                    <div className="space-y-3">
-                      {paymentMethods.map((method) => {
-                        const selected = (provider ?? paymentMethods[0].provider) === method.provider;
-                        return (
-                          <label
-                            key={method.provider}
-                            className={clsx(
-                              'flex cursor-pointer items-center gap-4 border p-4 transition-colors',
-                              selected ? 'border-ink-900 bg-ink-50/60' : 'border-ink-200 hover:border-ink-400',
-                            )}
-                          >
-                            <input
-                              type="radio"
-                              name="payment-provider"
-                              value={method.provider}
-                              checked={selected}
-                              onChange={() => setProvider(method.provider)}
-                              className="h-4 w-4 border-ink-300 text-ink-900 focus:ring-ink-900"
-                            />
-                            <span className="flex-1">
-                              <span className="block font-sans text-[0.9375rem] text-ink-900">{method.label}</span>
-                              <span className="mt-0.5 block font-sans text-micro text-ink-400">
-                                {method.flow === 'redirect'
-                                  ? 'You will finish paying on the provider’s secure page.'
-                                  : method.flow === 'cod'
-                                    ? 'Pay in cash when your order arrives.'
-                                    : 'Card details are entered on the next screen, secured by the provider.'}
-                              </span>
-                            </span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  </fieldset>
-
                   <div className="mt-8 space-y-5 border-t border-ink-100 pt-8">
                     <label className="flex cursor-pointer items-start gap-3">
                       <input
@@ -549,10 +519,12 @@ export function CheckoutFlow() {
                   >
                     {placing ? (
                       <>
-                        <Spinner className="h-4 w-4" /> Placing your order…
+                        <Spinner className="h-4 w-4" /> {selectedProvider === 'phonepe' ? 'Opening PhonePe…' : 'Placing your order…'}
                       </>
-                    ) : (provider ?? paymentMethods[0]?.provider) === 'cod' ? (
+                    ) : selectedProvider === 'cod' ? (
                       <>Place order · pay {formatMoney(totals.total)} on delivery</>
+                    ) : selectedProvider === 'phonepe' ? (
+                      <>Pay {formatMoney(totals.total)} with PhonePe</>
                     ) : (
                       <>Pay {formatMoney(totals.total)}</>
                     )}

@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { get, post, ApiClientError } from '@/lib/api';
+import { get, ApiClientError } from '@/lib/api';
+import { paymentProvider, paymentDestination, startOrderPayment } from '@/lib/payments';
 import { useCart, usePreferences } from '@/lib/store';
 import { formatMoney } from '@/lib/format';
 import type { Order } from '@/lib/types';
@@ -42,6 +43,7 @@ export function PaymentProcessing() {
 
   const orderNumber = params.get('order');
   const email = params.get('email') ?? '';
+  const [provider, setProvider] = useState(paymentProvider(params.get('provider')));
 
   const [clientSecret, setClientSecret] = useState(params.get('cs'));
   const [state, setState] = useState<'payment' | 'checking' | 'failed' | 'timeout' | 'missing'>(params.get('cs') && !params.get('redirect_status') ? 'payment' : 'checking');
@@ -83,7 +85,7 @@ export function PaymentProcessing() {
           return;
         }
 
-        if (data.paymentStatus === 'failed' || data.paymentStatus === 'cancelled') {
+        if (data.paymentStatus === 'failed' || data.paymentStatus === 'cancelled' || data.paymentStatus === 'unpaid') {
           setState('failed');
           return;
         }
@@ -114,19 +116,17 @@ export function PaymentProcessing() {
   }, [orderNumber, query, currency, router, loadCart, state, pollVersion]);
 
   const retry = useCallback(async () => {
-    if (!orderNumber) return;
+    if (!orderNumber || retrying) return;
     setRetrying(true);
     setRetryError(null);
 
     try {
-      const payment = await post<{ clientSecret: string | null; redirectUrl: string | null }>(
-        `/checkout/orders/${orderNumber}/payment${query}`,
-        { returnUrl: `${window.location.origin}/checkout/processing?${new URLSearchParams({ order: orderNumber, email })}` },
-        { currency },
-      );
+      const payment = await startOrderPayment({ orderNumber, email, provider, currency, origin: window.location.origin });
+      setProvider(payment.provider);
+      const destination = paymentDestination(payment, orderNumber, email);
 
-      if (payment.redirectUrl) {
-        window.location.href = payment.redirectUrl;
+      if (destination.external) {
+        window.location.assign(destination.url);
         return;
       }
       // Reset and poll again for an inline retry.
@@ -134,6 +134,11 @@ export function PaymentProcessing() {
       setState(payment.clientSecret ? 'payment' : 'checking');
       setPollVersion((value) => value + 1);
     } catch (error) {
+      if (error instanceof ApiClientError && error.code === 'PAYMENT_PROCESSING') {
+        setState('checking');
+        setPollVersion((value) => value + 1);
+        return;
+      }
       setRetryError(
         error instanceof ApiClientError
           ? error.message
@@ -142,7 +147,7 @@ export function PaymentProcessing() {
     } finally {
       setRetrying(false);
     }
-  }, [orderNumber, query, currency, email]);
+  }, [orderNumber, currency, email, provider, retrying]);
 
   if (state === 'payment' && clientSecret && orderNumber) return <Shell title="Complete your payment">
     <p className="prose-craft">Order {orderNumber}. Enter your payment details securely below.</p>
@@ -169,13 +174,13 @@ export function PaymentProcessing() {
 
   if (state === 'checking') {
     return (
-      <Shell title="Confirming your payment" icon={<Spinner className="h-8 w-8 text-ink-400" />}>
+      <Shell title={provider === 'phonepe' ? 'Confirming your PhonePe payment' : 'Confirming your payment'} icon={<Spinner className="h-8 w-8 text-ink-400" />}>
         <p className="prose-craft">
-          This usually takes a few seconds. Please do not close this window or press back — your order{' '}
+          {provider === 'phonepe' ? 'We are checking your payment securely with PhonePe. ' : 'This usually takes a few seconds. '}Your order{' '}
           {result?.order.orderNumber && (
             <span className="font-medium text-ink-900">{result.order.orderNumber}</span>
           )}{' '}
-          is safe either way.
+          is saved. Confirmation will appear once the payment is verified.
         </p>
       </Shell>
     );
@@ -189,8 +194,8 @@ export function PaymentProcessing() {
         </Notice>
 
         <p className="prose-craft mt-6">
-          Your order <span className="font-medium text-ink-900">{orderNumber}</span> is saved and the pieces are still
-          available subject to stock when you retry. You can try again.
+          Your order <span className="font-medium text-ink-900">{orderNumber}</span> is saved.{' '}
+          {result?.canRetryPayment ? 'You can retry payment, subject to stock availability.' : 'This order can no longer be paid for. Please contact us if you need help.'}
         </p>
 
         {result?.order.totals.total && (
@@ -206,9 +211,9 @@ export function PaymentProcessing() {
         )}
 
         <div className="mt-8 flex flex-wrap gap-3">
-          <button type="button" onClick={retry} disabled={retrying} className="btn-primary">
-            {retrying ? <Spinner className="h-4 w-4" /> : 'Try payment again'}
-          </button>
+          {result?.canRetryPayment && <button type="button" onClick={retry} disabled={retrying} className="btn-primary">
+            {retrying ? <Spinner className="h-4 w-4" /> : provider === 'phonepe' ? 'Try PhonePe again' : 'Try payment again'}
+          </button>}
           <Link href="/cart" className="btn-secondary">
             Back to basket
           </Link>
@@ -241,9 +246,14 @@ export function PaymentProcessing() {
         <Link href={`/orders/${orderNumber}${query}`} className="btn-primary">
           Check order status
         </Link>
-        <button type="button" onClick={retry} disabled={retrying} className="btn-secondary">
-          {retrying ? <Spinner className="h-4 w-4" /> : 'Try payment again'}
+        <button type="button" onClick={() => { setState('checking'); setPollVersion((value) => value + 1); }} className="btn-secondary">
+          Check payment again
         </button>
+        {provider === 'phonepe' && result?.canRetryPayment && result.paymentStatus === 'awaiting-payment' && (
+          <button type="button" onClick={retry} disabled={retrying} className="btn-secondary">
+            {retrying ? <Spinner className="h-4 w-4" /> : 'Continue with PhonePe'}
+          </button>
+        )}
       </div>
     </Shell>
   );

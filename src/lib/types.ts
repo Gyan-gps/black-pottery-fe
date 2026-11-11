@@ -336,6 +336,7 @@ export type PaymentMethod = {
   label: string;
   flow: 'inline' | 'redirect' | 'cod';
   logo: string;
+  testMode?: boolean;
 };
 
 export type Review = {
